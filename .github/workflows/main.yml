@@ -54,13 +54,13 @@ jobs:
     - name: Archive package
       run: |
         version="${GITHUB_REF#refs/tags/}"
-        tar -czf AcceleratorCSS-${version}.tar.gz -C build/package .
+        tar -czf AcceleratorCS2-${version}.tar.gz -C build/package .
 
     - name: Upload release archive
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: AcceleratorCSS-*.tar.gz
+        file: AcceleratorCS2-*.tar.gz
         tag: ${{ github.ref }}
         file_glob: true
         release_name: "${{ github.ref_name }} - Download"

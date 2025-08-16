@@ -7,8 +7,8 @@ export XMAKE_ROOT=y
 
 # Get version from git or use default
 VERSION=$(git describe --tags --long 2>/dev/null || echo "1.0-dev")
-export ACCELERATORCSS_VERSION="$VERSION"
-echo "Setting version to \"$ACCELERATORCSS_VERSION\""
+export ACCELERATORCS2_VERSION="$VERSION"
+echo "Setting version to \"$ACCELERATORCS2_VERSION\""
 
 # Configure & build native plugin
 xmake f -y -p linux -a x86_64 --mode=debug
@@ -16,15 +16,11 @@ xmake -y
 
 # Prepare folders
 mkdir -p build/package/addons/metamod
-mkdir -p build/package/addons/AcceleratorCSS
-mkdir -p build/package/addons/AcceleratorCSS/bin/linuxsteamrt64
-mkdir -p build/package/addons/counterstrikesharp/plugins
+mkdir -p build/package/addons/AcceleratorCS2
+mkdir -p build/package/addons/AcceleratorCS2/bin/linuxsteamrt64
 
 # Copy configs
-cp configs/addons/metamod/AcceleratorCSS.vdf build/package/addons/metamod
-cp configs/addons/AcceleratorCSS/config.json build/package/addons/AcceleratorCSS
-cp build/linux/x86_64/debug/libAcceleratorCSS.so \
-   build/package/addons/AcceleratorCSS/bin/linuxsteamrt64/AcceleratorCSS.so
-
-# Build managed
-dotnet publish managed/AcceleratorCSS_CSS/AcceleratorCSS_CSS.csproj -c Release -o build/package/addons/counterstrikesharp/plugins/AcceleratorCSS_CSS
+cp configs/addons/metamod/AcceleratorCS2.vdf build/package/addons/metamod
+cp configs/addons/AcceleratorCS2/config.json build/package/addons/AcceleratorCS2
+cp build/linux/x86_64/debug/libAcceleratorCS2.so \
+   build/package/addons/AcceleratorCS2/bin/linuxsteamrt64/AcceleratorCS2.so

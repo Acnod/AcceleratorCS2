@@ -1,5 +1,4 @@
-﻿-- AcceleratorCSS build script for xmake
-local ACCELERATORCSS_VERSION = os.getenv("ACCELERATORCSS_VERSION") or "1.0-dev"
+﻿-- AcceleratorCS2 build script for xmake
 
 add_rules("mode.debug")
 
@@ -14,15 +13,15 @@ add_requires("zlib")
 local ROOT     = os.projectdir()
 local SDK_PATH = os.getenv("HL2SDKCS2")
 local MM_PATH = os.getenv("MMSOURCE112")
+local ACCELERATORCS2_VERSION = os.getenv("ACCELERATORCS2_VERSION") or "2.0-dev"
 
-target("AcceleratorCSS")
+target("AcceleratorCS2")
   set_kind("shared")
   set_languages("cxx20")
   set_symbols("hidden")
 
   add_defines("stricmp=strcasecmp")
-  add_defines(string.format("ACCELERATORCSS_VERSION=\"%s\"", ACCELERATORCSS_VERSION))
-  add_cxxflags("-include", "hl2sdk_compat.h")
+  add_defines(string.format("ACCELERATORCS2_VERSION=\"%s\"", ACCELERATORCS2_VERSION))
 
   -- Source files
   add_files({
@@ -39,7 +38,7 @@ target("AcceleratorCSS")
       path.join(MM_PATH, "core/sourcehook/sourcehook_impl_chookmaninfo.cpp"),
       path.join(MM_PATH, "core/sourcehook/sourcehook_impl_cvfnptr.cpp"),
       path.join(MM_PATH, "core/sourcehook/sourcehook_impl_cproto.cpp"),
-      path.join(ROOT, "src", "log.cpp"),
+      path.join(ROOT, "src", "presubmit.cpp"),
       path.join(ROOT, "protobufs", "generated", "**.pb.cc"),
       "vendor/breakpad/src/common/dwarf_cfi_to_module.cc",
       "vendor/breakpad/src/common/dwarf_cu_to_module.cc",
@@ -99,6 +98,7 @@ target("AcceleratorCSS")
       path.join(ROOT, "protobufs", "generated"),
       path.join(ROOT, "breakpad-config", "linux"),
       path.join(ROOT, "vendor", "breakpad", "src"),
+      path.join(ROOT, "vendor", "boost"),
       -- SDK
       SDK_PATH,
       path.join(SDK_PATH, "thirdparty", "protobuf-3.21.8", "src"),

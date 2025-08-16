@@ -8,3 +8,6 @@
 [submodule "vendor/breakpad"]
 	path = vendor/breakpad
 	url = https://github.com/SlynxCZ/breakpad.git
+[submodule "vendor/boost"]
+	path = vendor/boost
+	url = https://github.com/steinwurf/boost

@@ -1,409 +1,586 @@
-//
-// Created by Michal Přikryl on 12.06.2025.
-// Copyright (c) 2025 slynxcz. All rights reserved.
-//
-#include "extension.h"
-#include "CMiniDumpComment.hpp"
-#include "log.h"
+﻿#include "extension.h"
 
-#include <nlohmann/json.hpp>
-#include <entitysystem.h>
-#include <entity2/entitysystem.h>
-
-#include <csignal>
-#include <ctime>
-#include <deque>
-#include <dirent.h>
-#include <dlfcn.h>
-#include <filesystem>
-#include <fstream>
-#include <limits>
-#include <mutex>
-#include <signal.h>
-#include <sstream>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
-
-#if defined WIN32
-#include <corecrt_io.h>
-#else
+#if defined _LINUX
 #include "client/linux/handler/exception_handler.h"
 #include "common/linux/linux_libc_support.h"
 #include "third_party/lss/linux_syscall_support.h"
 #include "common/linux/http_upload.h"
+
+#include <dirent.h>
+#include <unistd.h>
+#else
+#include "client/windows/handler/exception_handler.h"
+#include "common/windows/http_upload.h"
 #endif
 
-#include "paths.h"
+#include "nlohmann/json.hpp"
+
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <limits>
+#include <filesystem>
+#include <codecvt>
+#include <thread>
+#include <fstream>
+#include <sstream>
+
 #include "common/path_helper.h"
 #include "common/using_std_string.h"
 #include "google_breakpad/processor/basic_source_line_resolver.h"
 #include "google_breakpad/processor/minidump_processor.h"
 #include "google_breakpad/processor/process_state.h"
-#include "google_breakpad/processor/call_stack.h"
-#include "google_breakpad/processor/stack_frame.h"
 #include "processor/simple_symbol_supplier.h"
 #include "processor/stackwalk_common.h"
-#include "processor/pathname_stripper.h"
+#include <google_breakpad/processor/call_stack.h>
+#include <google_breakpad/processor/stack_frame.h>
+#include <processor/pathname_stripper.h>
 
-size_t g_MaxCallbackTrace = 10;
+#include <entity2/entitysystem.h>
+#if defined WIN32
+#include <corecrt_io.h>
+#endif
 
-struct CallbackTraceEntry {
-    std::string name;
-    std::string profile;
-    std::string callerStack;
-};
+#include "presubmit.h"
 
-std::vector<CallbackTraceEntry> g_CallbackTraceBuffer;
-size_t g_CallbackTraceIndex = 0;
-std::mutex g_CallbackTraceMutex;
+#include "boost/scoped_ptr.hpp"
 
-namespace fs = std::filesystem;
+AcceleratorCS2 g_AcceleratorCS2;
+PLUGIN_EXPOSE(AcceleratorCS2, g_AcceleratorCS2);
 
-ISmmAPI *g_ISmm = nullptr;
-
-static std::string lastMap;
 char crashMap[256];
 char crashGamePath[512];
 char crashCommandLine[1024];
 char dumpStoragePath[512];
+std::string g_serverId;
+std::string g_UserId;
 
-google_breakpad::ExceptionHandler *exceptionHandler = nullptr;
-CMiniDumpComment g_MiniDumpComment(95000);
+CGameEntitySystem *GameEntitySystem()
+{
+	return nullptr;
+}
 
-void (*SignalHandler)(int, siginfo_t *, void *);
+class GameSessionConfiguration_t { };
+SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
+SH_DECL_HOOK3_void(INetworkServerService, StartupServer, SH_NOATTRIB, 0, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*);
 
-const int kExceptionSignals[] = {SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS};
+google_breakpad::ExceptionHandler* exceptionHandler = nullptr;
+
+void signal_safe_hex_print(int num)
+{
+	if (num > 15) {
+		signal_safe_hex_print(num / 16);
+	}
+	char c = "0123456789ABCDEF"[num % 16];
+#if defined _LINUX
+	sys_write(STDOUT_FILENO, &c, 1);
+#else
+	write(fileno(stdout), &c, 1);
+#endif
+}
+
+#if defined _LINUX
+void (*SignalHandler)(int, siginfo_t*, void*);
+const int kExceptionSignals[] = { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS };
 const int kNumHandledSignals = std::size(kExceptionSignals);
 
-bool g_pluginRegistered = false;
-
-auto safeStr = [](const char *str) -> std::string {
-    if (!str)
-        return "[null]";
-    try {
-        return std::string(str);
-    } catch (...) {
-        return "[invalid string]";
-    }
-};
-
-struct PluginConfig {
-    bool LightweightMode;
-    bool LogCallbacksToConsole;
-    int CallbackLogSize;
-    const char* FiltersPtr;
-};
-
-PluginConfig config{};
-
-DLL_EXPORT void RegisterCallbackTraceBinary(const void* data, size_t len) {
-    if (!data || len < 6) return;
-
-    const char* raw = reinterpret_cast<const char*>(data);
-    uint16_t nameLen = *reinterpret_cast<const uint16_t*>(raw);
-    uint16_t profileLen = *reinterpret_cast<const uint16_t*>(raw + 2);
-    uint16_t stackLen = *reinterpret_cast<const uint16_t*>(raw + 4);
-
-    if (len < 6 + nameLen + profileLen + stackLen) return;
-
-    std::string name(raw + 6, nameLen);
-    std::string profile(raw + 6 + nameLen, profileLen);
-    std::string stack(raw + 6 + nameLen + profileLen, stackLen);
-
-    if (config.LogCallbacksToConsole) {
-        ACC_CORE_INFO("[Callback] Name: {}", name);
-    }
-
-    std::lock_guard lock(g_CallbackTraceMutex);
-
-    if (g_CallbackTraceBuffer.empty())
-        return;
-
-    size_t bufferSize = g_CallbackTraceBuffer.size();
-    g_CallbackTraceBuffer[g_CallbackTraceIndex % bufferSize] = {
-        std::move(name), std::move(profile), std::move(stack)
-    };
-    g_CallbackTraceIndex++;
-}
-
-void SetMaxCallbackTrace(size_t newSize) {
-    std::lock_guard lock(g_CallbackTraceMutex);
-
-    if (newSize == 0)
-        return;
-
-    g_CallbackTraceBuffer.clear();
-    g_CallbackTraceBuffer.resize(newSize);
-    g_CallbackTraceIndex = 0;
-}
-
-DLL_EXPORT PluginConfig CssPluginRegistered()
+static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, void* context, bool succeeded)
 {
-    static std::string filtersJoined;
+	if (succeeded)
+		sys_write(STDOUT_FILENO, "Wrote minidump to: ", 19);
+	else
+		sys_write(STDOUT_FILENO, "Failed to write minidump to: ", 29);
 
-    config.LightweightMode = true;
+	sys_write(STDOUT_FILENO, descriptor.path(), my_strlen(descriptor.path()));
+	sys_write(STDOUT_FILENO, "\n", 1);
 
-    try {
-        std::ifstream configFile(AcceleratorCSS::paths::ConfigDirectory());
-        if (configFile.is_open()) {
-            nlohmann::json j;
-            configFile >> j;
+	if (!succeeded)
+		return succeeded;
 
-            if (j.contains("LightweightMode") && j["LightweightMode"].is_boolean())
-                config.LightweightMode = j["LightweightMode"].get<bool>();
+	my_strlcpy(dumpStoragePath, descriptor.path(), sizeof(dumpStoragePath));
+	my_strlcat(dumpStoragePath, ".txt", sizeof(dumpStoragePath));
 
-            if (j.contains("LogCallbacksToConsole") && j["LogCallbacksToConsole"].is_boolean())
-                config.LogCallbacksToConsole = j["LogCallbacksToConsole"].get<bool>();
+	int extra = sys_open(dumpStoragePath, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+	if (extra == -1)
+	{
+		sys_write(STDOUT_FILENO, "Failed to open metadata file!\n", 30);
+		return succeeded;
+	}
 
-            if (j.contains("CallbackLogSize") && j["CallbackLogSize"].is_number_integer()) {
-                config.CallbackLogSize = j["CallbackLogSize"].get<int>();
-                SetMaxCallbackTrace(config.CallbackLogSize);
-            }
-            if (j.contains("ProfileExcludeFilters") && j["ProfileExcludeFilters"].is_array()) {
-                std::ostringstream oss;
-                for (const auto& item : j["ProfileExcludeFilters"]) {
-                    if (item.is_string())
-                        oss << item.get<std::string>() << ",";
-                }
+	sys_write(extra, "-------- CONFIG BEGIN --------", 30);
+	sys_write(extra, "\nMap=", 5);
+	sys_write(extra, crashMap, my_strlen(crashMap));
+	sys_write(extra, "\nGamePath=", 10);
+	sys_write(extra, crashGamePath, my_strlen(crashGamePath));
+	sys_write(extra, "\nCommandLine=", 13);
+	sys_write(extra, crashCommandLine, my_strlen(crashCommandLine));
+	sys_write(extra, "\n-------- CONFIG END --------\n", 30);
+	sys_write(extra, "\n", 1);
 
-                filtersJoined = oss.str();
-                if (!filtersJoined.empty() && filtersJoined.back() == ',')
-                    filtersJoined.pop_back();
+	boost::scoped_ptr<google_breakpad::SimpleSymbolSupplier> symbolSupplier;
+	google_breakpad::BasicSourceLineResolver resolver;
+	google_breakpad::MinidumpProcessor minidump_processor(symbolSupplier.get(), &resolver);
 
-                config.FiltersPtr = filtersJoined.c_str();
-            }
+	// Increase the maximum number of threads and regions.
+	google_breakpad::MinidumpThreadList::set_max_threads(std::numeric_limits<uint32_t>::max());
+	google_breakpad::MinidumpMemoryList::set_max_regions(std::numeric_limits<uint32_t>::max());
+	// Process the minidump.
+	google_breakpad::Minidump miniDump(descriptor.path());
+	if (!miniDump.Read())
+	{
+		sys_write(STDOUT_FILENO, "Failed to read minidump\n", 24);
+	}
+	else
+	{
+		google_breakpad::ProcessState processState;
+		if (minidump_processor.Process(&miniDump, &processState) != google_breakpad::PROCESS_OK)
+		{
+			sys_write(STDOUT_FILENO, "MinidumpProcessor::Process failed\n", 34);
+		}
+		else
+		{
+			int requestingThread = processState.requesting_thread();
+			if (requestingThread == -1) {
+				requestingThread = 0;
+			}
 
-            g_pluginRegistered = true;
-        }
-    } catch (...) {
-        filtersJoined = "OnTick,CheckTransmit,Display";
-        config.FiltersPtr = filtersJoined.c_str();
-    }
+			const google_breakpad::CallStack* stack = processState.threads()->at(requestingThread);
+			int frameCount = stack->frames()->size();
+			if (frameCount > 15) {
+				frameCount = 15;
+			}
 
-    return config;
+			//std::ostringstream stream;
+
+			sys_write(STDOUT_FILENO, "\n", 1);
+			for (int frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
+				auto frame = stack->frames()->at(frameIndex);
+
+				auto moduleOffset = frame->ReturnAddress();
+				if (frame->module) {
+					auto moduleFile = google_breakpad::PathnameStripper::File(frame->module->code_file());
+					moduleOffset -= frame->module->base_address();
+					sys_write(STDOUT_FILENO, moduleFile.c_str(), moduleFile.size());
+					sys_write(STDOUT_FILENO, " (0x", 4);
+					signal_safe_hex_print(moduleOffset);
+					sys_write(STDOUT_FILENO, ")\n", 2);
+				}
+				else {
+					sys_write(STDOUT_FILENO, "unknown (0x", 11);
+					signal_safe_hex_print(moduleOffset);
+					sys_write(STDOUT_FILENO, ") \n", 3);
+				}
+			}
+
+			//sys_write(STDOUT_FILENO, stream.str().c_str(), stream.str().length());
+
+			freopen(dumpStoragePath, "a", stdout);
+			PrintProcessState(processState, true, false, &resolver);
+			fflush(stdout);
+		}
+	}
+
+	sys_close(extra);
+
+	return succeeded;
+}
+#else
+void* vectoredHandler = NULL;
+
+LONG CALLBACK BreakpadVectoredHandler(_In_ PEXCEPTION_POINTERS ExceptionInfo)
+{
+	switch (ExceptionInfo->ExceptionRecord->ExceptionCode)
+	{
+	case EXCEPTION_ACCESS_VIOLATION:
+	case EXCEPTION_INVALID_HANDLE:
+	case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+	case EXCEPTION_DATATYPE_MISALIGNMENT:
+	case EXCEPTION_ILLEGAL_INSTRUCTION:
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:
+	case EXCEPTION_STACK_OVERFLOW:
+	case 0xC0000409: // STATUS_STACK_BUFFER_OVERRUN
+	case 0xC0000374: // STATUS_HEAP_CORRUPTION
+		break;
+	case 0: // Valve use this for Sys_Error.
+		if ((ExceptionInfo->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE) == 0)
+			return EXCEPTION_CONTINUE_SEARCH;
+		break;
+	default:
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	if (exceptionHandler->WriteMinidumpForException(ExceptionInfo))
+	{
+		// Stop the handler thread from deadlocking us.
+		delete exceptionHandler;
+
+		// Stop Valve's handler being called.
+		ExceptionInfo->ExceptionRecord->ExceptionCode = EXCEPTION_BREAKPOINT;
+
+		return EXCEPTION_EXECUTE_HANDLER;
+	}
+	else {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 }
 
-static bool dumpCallback(const google_breakpad::MinidumpDescriptor &descriptor, void *context, bool succeeded) {
-    ACC_CORE_CRITICAL("- [ Crash detected! Writing custom crash log... ] -");
+std::string ws2s(const std::wstring& wstr)
+{
+	using convert_typeX = std::codecvt_utf8<wchar_t>;
+	std::wstring_convert<convert_typeX, wchar_t> converterX;
 
-    my_strlcpy(dumpStoragePath, descriptor.path(), sizeof(dumpStoragePath));
-    my_strlcat(dumpStoragePath, ".txt", sizeof(dumpStoragePath));
-
-    std::ofstream dumpFile(dumpStoragePath, std::ios::out | std::ios::trunc);
-    if (!dumpFile.is_open()) {
-        ACC_CORE_ERROR("- [ Failed to open crash log file: {} ] -", dumpStoragePath);
-        return false;
-    }
-
-    dumpFile << "-------- CONFIG BEGIN --------\n";
-    dumpFile << "Map=" << crashMap << "\n";
-    dumpFile << "GamePath=" << crashGamePath << "\n";
-    dumpFile << "CommandLine=" << crashCommandLine << "\n";
-    dumpFile << "-------- CONFIG END --------\n\n";
-
-    LoggingSystem_GetLogCapture(&g_MiniDumpComment, true);
-    const char *pszConsoleHistory = g_MiniDumpComment.GetStartPointer();
-
-    if (pszConsoleHistory[0]) {
-        dumpFile << "-------- CONSOLE HISTORY BEGIN --------\n";
-        dumpFile << pszConsoleHistory;
-        dumpFile << "-------- CONSOLE HISTORY END --------\n\n";
-    }
-
-    dumpFile << "-------- CALLBACK TRACE BEGIN --------\n";
-    {
-        std::lock_guard lock(g_CallbackTraceMutex);
-
-        const size_t bufferSize = g_CallbackTraceBuffer.size();
-        const size_t validCount = std::min(bufferSize, g_CallbackTraceIndex);
-
-        for (size_t i = 0; i < validCount; ++i) {
-            size_t idx = (g_CallbackTraceIndex - 1 - i) % bufferSize;
-            const auto& entry = g_CallbackTraceBuffer[idx];
-
-            dumpFile << "Name: " << entry.name << "\n";
-            dumpFile << "Profile: " << entry.profile << "\n";
-            dumpFile << "Stack:\n" << entry.callerStack << "\n";
-            dumpFile << "-----------------------------\n";
-        }
-    }
-    dumpFile << "-------- CALLBACK TRACE END --------\n";
-
-    dumpFile.close();
-
-    ACC_CORE_INFO("Custom crash log written to: {}", dumpStoragePath);
-    return true;
+	return converterX.to_bytes(wstr);
 }
 
-CGameEntitySystem *GameEntitySystem() { return nullptr; }
+static bool dumpCallback(const wchar_t* dump_path,
+	const wchar_t* minidump_id,
+	void* context,
+	EXCEPTION_POINTERS* exinfo,
+	MDRawAssertionInfo* assertion,
+	bool succeeded)
+{
+	if (!succeeded) {
+		printf("Failed to write minidump to: %ls\\%ls.dmp\n", dump_path, minidump_id);
+		return succeeded;
+	}
 
-class GameSessionConfiguration_t {
+	sprintf(dumpStoragePath, "%ls\\%ls.dmp.txt", dump_path, minidump_id);
+
+	FILE* extra = fopen(dumpStoragePath, "wb");
+	if (!extra) {
+		printf("Failed to open metadata file!\n");
+		return succeeded;
+	}
+
+	fprintf(extra, "-------- CONFIG BEGIN --------");
+	fprintf(extra, "\nMap=%s", crashMap);
+	fprintf(extra, "\nGamePath=%s", crashGamePath);
+	fprintf(extra, "\nCommandLine=%s", crashCommandLine);
+	fprintf(extra, "\n-------- CONFIG END --------\n");
+	fprintf(extra, "\n");
+
+	google_breakpad::scoped_ptr<google_breakpad::SimpleSymbolSupplier> symbolSupplier;
+	google_breakpad::BasicSourceLineResolver resolver;
+	google_breakpad::MinidumpProcessor minidump_processor(symbolSupplier.get(), &resolver);
+
+	// Increase the maximum number of threads and regions.
+#undef max
+	google_breakpad::MinidumpThreadList::set_max_threads(std::numeric_limits<uint32_t>::max());
+	google_breakpad::MinidumpMemoryList::set_max_regions(std::numeric_limits<uint32_t>::max());
+	// Process the minidump.
+	std::wstring widestr = std::wstring(dump_path) + L"\\" + std::wstring(minidump_id) + L".dmp";
+	google_breakpad::Minidump miniDump(ws2s(widestr));
+	if (!miniDump.Read())
+	{
+		printf("Failed to read minidump\n");
+	}
+	else
+	{
+		google_breakpad::ProcessState processState;
+		if (minidump_processor.Process(&miniDump, &processState) != google_breakpad::PROCESS_OK)
+		{
+			printf("MinidumpProcessor::Process failed\n");
+		}
+		else
+		{
+			freopen(dumpStoragePath, "a", stdout);
+			PrintProcessState(processState, true, false, &resolver);
+			fflush(stdout);
+		}
+	}
+
+	fclose(extra);
+
+	return succeeded;
+}
+#endif
+
+#ifdef _LINUX
+void UploadThread()
+{
+	for (const auto& entry : std::filesystem::directory_iterator(dumpStoragePath)) {
+		if (entry.path().extension() == ".dmp") {
+			std::filesystem::path uploadedPath = entry.path();
+
+			// is dump already uploaded
+			if (entry.path().stem().string().find("_uploaded") != std::string::npos) {
+				continue;
+			}
+
+			char tokenBuffer[64];
+			PresubmitCrashDump(entry.path().string().c_str(), tokenBuffer, sizeof(tokenBuffer));
+
+			ConMsg("Uploading minidump %s\n", entry.path().string().c_str());
+
+			std::map<std::string, std::string> params;
+
+			params["UserID"] = g_UserId;
+			params["GameDirectory"] = "csgo";
+			params["ExtensionVersion"] = std::string(g_AcceleratorCS2.GetVersion()) + " [AcceleratorCS2 Build]";
+			params["ServerID"] = g_serverId;
+
+			if (tokenBuffer[0] != '\0')
+			{
+				params["PresubmitToken"] = tokenBuffer;
+			}
+
+			std::filesystem::path metadataPath = entry.path();
+			metadataPath.replace_extension(".dmp.txt");
+
+			std::map<std::string, std::string> files;
+			files["upload_file_minidump"] = entry.path().string();
+			files["upload_file_metadata"] = metadataPath.string();
+
+			std::string res;
+			google_breakpad::HTTPUpload::SendRequest("http://crash.limetech.org/submit", params, files, "", "", "", &res, nullptr, nullptr);
+
+			ConMsg("Upload response: %s\n", res.c_str());
+
+			uploadedPath.replace_filename(uploadedPath.stem().string() + "_uploaded" + uploadedPath.extension().string());
+			std::filesystem::rename(entry.path(), uploadedPath);
+		}
+	}
+};
+#else
+void UploadThread()
+{
+	for (const auto& entry : std::filesystem::directory_iterator(dumpStoragePath)) {
+		if (entry.path().extension() == ".dmp") {
+			std::filesystem::path uploadedPath = entry.path();
+
+
+			// is dump already uploaded
+			if (entry.path().stem().string().find("_uploaded") != std::string::npos) {
+				continue;
+			}
+
+			char tokenBuffer[64];
+			PresubmitCrashDump(entry.path().string().c_str(), tokenBuffer, sizeof(tokenBuffer));
+
+			ConMsg("Uploading minidump %s\n", entry.path().string().c_str());
+
+			std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> strconverter;
+			std::map<std::wstring, std::wstring> params;
+
+			params[L"UserID"] = strconverter.from_bytes(g_UserId).c_str();
+			params[L"GameDirectory"] = L"csgo";
+			params[L"ExtensionVersion"] = strconverter.from_bytes(g_AcceleratorCS2.GetVersion()) + L" [AcceleratorCS2 Build]";
+			params[L"ServerID"] = strconverter.from_bytes(g_serverId).c_str();
+
+			if (tokenBuffer[0] != '\0')
+			{
+				params[L"PresubmitToken"] = strconverter.from_bytes(tokenBuffer).c_str();
+			}
+
+			std::filesystem::path metadataPath = entry.path();
+			metadataPath.replace_extension(".dmp.txt");
+
+			std::map<std::wstring, std::wstring> files;
+			files[L"upload_file_minidump"] = entry.path().wstring();
+			files[L"upload_file_metadata"] = metadataPath.wstring();
+
+			std::wstring res;
+			google_breakpad::HTTPUpload::SendMultipartPostRequest(L"http://crash.limetech.org/submit", params, files, nullptr, &res, nullptr);
+
+			ConMsg("Upload response: %s\n", strconverter.to_bytes(res).c_str());
+
+			uploadedPath.replace_filename(uploadedPath.stem().string() + "_uploaded" + uploadedPath.extension().string());
+			std::filesystem::rename(entry.path(), uploadedPath);
+		}
+	}
+};
+#endif
+
+void LoadServerId()
+{
+	std::string serverIdPath = std::string(crashGamePath) + "/addons/AcceleratorCS2/serverid.txt";
+	std::ifstream serverIdFile(serverIdPath);
+	if (serverIdFile.is_open()) {
+		serverIdFile >> g_serverId;
+		serverIdFile.close();
+	}
+	else {
+		char buffer[64];
+		V_snprintf(buffer, sizeof(buffer), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+			rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, 0x40 | ((rand() % 255) & 0x0F), rand() % 255,
+			0x80 | ((rand() % 255) & 0x3F), rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255);
+		g_serverId = buffer;
+
+		std::ofstream serverIdFile(serverIdPath);
+		if (serverIdFile.is_open()) {
+			serverIdFile << g_serverId;
+			serverIdFile.close();
+		}
+	}
 };
 
-PLUGIN_EXPOSE(AcceleratorCSS_MM, acceleratorcss::gPlugin);
+void LoadConfig()
+{
+	// load json config
+	std::string configPath = std::string(crashGamePath) + "/addons/AcceleratorCS2/config.json";
+	std::ifstream configFile(configPath);
+	if (configFile.is_open()) {
+		nlohmann::json config;
+		configFile >> config;
+		configFile.close();
 
-SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
-SH_DECL_HOOK3_void(INetworkServerService, StartupServer, SH_NOATTRIB, 0, const GameSessionConfiguration_t&,
-                   ISource2WorldSession*, const char*);
+		if (config.contains("MinidumpAccountSteamId64")) {
+			g_UserId = config["MinidumpAccountSteamId64"];
+		}
+	}
+	else {
+		nlohmann::json config;
+		config["MinidumpAccountSteamId64"] = "";
 
-namespace acceleratorcss {
-    AcceleratorCSS_MM gPlugin;
+		std::ofstream configFile(configPath);
+		if (configFile.is_open()) {
+			configFile << config.dump(2);
+			configFile.close();
+		}
+	}
+}
 
-    bool AcceleratorCSS_MM::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late) {
-        PLUGIN_SAVEVARS();
-        Log::Init();
+bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
+{
+	PLUGIN_SAVEVARS();
 
-        GET_V_IFACE_CURRENT(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
-        GET_V_IFACE_CURRENT(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
-        GET_V_IFACE_CURRENT(GetEngineFactory, g_pEngineServer, IVEngineServer, INTERFACEVERSION_VENGINESERVER);
+	GET_V_IFACE_CURRENT(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
+	GET_V_IFACE_CURRENT(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
 
-        g_ISmm = ismm;
+	strncpy(crashGamePath, ismm->GetBaseDir(), sizeof(crashGamePath) - 1);
+	ismm->Format(dumpStoragePath, sizeof(dumpStoragePath), "%s/addons/AcceleratorCS2/dumps", ismm->GetBaseDir());
 
-        std::snprintf(crashGamePath, sizeof(crashGamePath), "%s", Paths::GameDirectory().c_str());
-        std::snprintf(dumpStoragePath, sizeof(dumpStoragePath), "%s", Paths::Logs().c_str());
+	std::filesystem::create_directory(dumpStoragePath);
 
-        if (crashGamePath[sizeof(crashGamePath) - 1] != '\0') {
-            ACC_CORE_ERROR("[DEBUG] crashGamePath not null-terminated!");
-            return false;
-        }
-        if (dumpStoragePath[sizeof(dumpStoragePath) - 1] != '\0') {
-            ACC_CORE_ERROR("[DEBUG] dumpStoragePath not null-terminated!");
-            return false;
-        }
+#if defined _LINUX
+	google_breakpad::MinidumpDescriptor descriptor(dumpStoragePath);
+	exceptionHandler = new google_breakpad::ExceptionHandler(descriptor, NULL, dumpCallback, NULL, true, -1);
 
-        struct stat st{};
-        if (stat(dumpStoragePath, &st) == -1) {
-            if (mkdir(dumpStoragePath, 0777) == -1) {
-                ACC_CORE_ERROR("Failed to create logs directory: {}", dumpStoragePath);
-                g_pluginRegistered = false;
-                return false;
-            }
-        } else {
-            chmod(dumpStoragePath, 0777);
-        }
+	struct sigaction oact;
+	sigaction(SIGSEGV, NULL, &oact);
+	SignalHandler = oact.sa_sigaction;
 
-        SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &AcceleratorCSS_MM::GameFrame), true);
-        SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService,
-                    SH_MEMBER(this, &AcceleratorCSS_MM::StartupServer), true);
+	SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &AcceleratorCS2::GameFrame), true);
+#else
+	wchar_t* buf = new wchar_t[sizeof(dumpStoragePath)];
+	size_t num_chars = mbstowcs(buf, dumpStoragePath, sizeof(dumpStoragePath));
 
-        std::snprintf(crashCommandLine, sizeof(crashCommandLine), "%s",
-                      CommandLine() ? CommandLine()->GetCmdLine() : "");
+	exceptionHandler = new google_breakpad::ExceptionHandler(
+		std::wstring(buf, num_chars), NULL, dumpCallback, NULL, google_breakpad::ExceptionHandler::HANDLER_ALL,
+		static_cast<MINIDUMP_TYPE>(MiniDumpWithUnloadedModules | MiniDumpWithFullMemoryInfo), static_cast<const wchar_t*>(NULL), NULL);
 
-        if (late) {
-            if (auto gs = g_pNetworkServerService->GetIGameServer()) {
-                if (const char* map = gs->GetMapName()) {
-                    StartupServer({}, nullptr, map);
-                }
-            }
-        }
+	vectoredHandler = AddVectoredExceptionHandler(0, BreakpadVectoredHandler);
 
-        g_SMAPI->AddListener(this, this);
+	delete buf;
+#endif
 
-        try {
-            std::ifstream configFile(AcceleratorCSS::paths::ConfigDirectory());
-            if (configFile.is_open()) {
-                configFile >> g_Config;
-                ACC_CORE_INFO("Config loaded: {}", AcceleratorCSS::paths::ConfigDirectory());
-            } else {
-                ACC_CORE_WARN("Could not open config: {}", AcceleratorCSS::paths::ConfigDirectory());
-                g_pluginRegistered = false;
-            }
-        } catch (const std::exception &e) {
-            ACC_CORE_ERROR("Failed to parse config: {}", e.what());
-            g_pluginRegistered = false;
-        }
+	SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &AcceleratorCS2::StartupServer), true);
 
-        google_breakpad::MinidumpDescriptor descriptor(dumpStoragePath);
-        exceptionHandler = new google_breakpad::ExceptionHandler(descriptor, nullptr, dumpCallback, nullptr, true, -1);
+	strncpy(crashCommandLine, CommandLine()->GetCmdLine(), sizeof(crashCommandLine) - 1);
 
-        struct sigaction oact{};
-        sigaction(SIGSEGV, nullptr, &oact);
-        SignalHandler = oact.sa_sigaction;
+	if (late)
+		StartupServer({}, nullptr, nullptr);
 
-        ACC_CORE_INFO("MM plugin loaded.");
-        return true;
-    }
+	LoadServerId();
+	LoadConfig();
 
-    bool AcceleratorCSS_MM::Unload(char *error, size_t maxlen) {
-        Log::Close();
-        g_pluginRegistered = false;
+	ConMsg("Start accelerator uploader thread\n");
+	new std::thread(UploadThread);
 
+	return true;
+}
 
-        SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &AcceleratorCSS_MM::GameFrame),
-                       true);
-        SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService,
-                       SH_MEMBER(this, &AcceleratorCSS_MM::StartupServer), true);
+bool AcceleratorCS2::Unload(char* error, size_t maxlen)
+{
+#if defined _LINUX
+	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &AcceleratorCS2::GameFrame), true);
+#endif
+	SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &AcceleratorCS2::StartupServer), true);
 
-        delete exceptionHandler;
+	delete exceptionHandler;
 
-        ACC_CORE_INFO("- [ MM plugin unloaded. ] -");
+	return true;
+}
 
-        return true;
-    }
+#if defined _LINUX
 
-    void AcceleratorCSS_MM::AllPluginsLoaded() {
-        std::thread([] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-            if (g_pluginRegistered)
-                ACC_CORE_INFO("- [ MM plugin is active and linked. ] -");
-            else
-                ACC_CORE_ERROR("- [ MM plugin did not register itself. ] -");
-        }).detach();
-    }
+void AcceleratorCS2::GameFrame(bool simulating, bool bFirstTick, bool bLastTick)
+{
+	bool weHaveBeenFuckedOver = false;
+	struct sigaction oact;
 
-    void AcceleratorCSS_MM::GameFrame(bool simulating, bool bFirstTick, bool bLastTick) {
-        bool weHaveBeenFuckedOver = false;
-        struct sigaction oact;
+	for (int i = 0; i < kNumHandledSignals; ++i)
+	{
+		sigaction(kExceptionSignals[i], NULL, &oact);
 
-        auto gs = g_pNetworkServerService->GetIGameServer();
-        const char* currentMap = gs ? gs->GetMapName() : nullptr;
-        if (currentMap && *currentMap && lastMap != currentMap) {
-            std::snprintf(crashMap, sizeof(crashMap), "%s", currentMap);
-            lastMap = currentMap;
-            ACC_CORE_INFO("- [ Detected map change: {} ] -", currentMap);
-        }
+		if (oact.sa_sigaction != SignalHandler)
+		{
+			weHaveBeenFuckedOver = true;
+			break;
+		}
+	}
 
-        for (int i = 0; i < kNumHandledSignals; ++i) {
-            sigaction(kExceptionSignals[i], NULL, &oact);
+	if (!weHaveBeenFuckedOver)
+		return;
 
-            if (oact.sa_sigaction != SignalHandler) {
-                weHaveBeenFuckedOver = true;
-                break;
-            }
-        }
+	struct sigaction act;
+	memset(&act, 0, sizeof(act));
+	sigemptyset(&act.sa_mask);
 
-        if (!weHaveBeenFuckedOver)
-            return;
+	for (int i = 0; i < kNumHandledSignals; ++i)
+		sigaddset(&act.sa_mask, kExceptionSignals[i]);
 
-        struct sigaction act;
-        memset(&act, 0, sizeof(act));
-        sigemptyset(&act.sa_mask);
+	act.sa_sigaction = SignalHandler;
+	act.sa_flags = SA_ONSTACK | SA_SIGINFO;
 
-        for (int i = 0; i < kNumHandledSignals; ++i)
-            sigaddset(&act.sa_mask, kExceptionSignals[i]);
+	for (int i = 0; i < kNumHandledSignals; ++i)
+		sigaction(kExceptionSignals[i], &act, NULL);
+}
 
-        act.sa_sigaction = SignalHandler;
-        act.sa_flags = SA_ONSTACK | SA_SIGINFO;
+#endif
 
-        for (int i = 0; i < kNumHandledSignals; ++i)
-            sigaction(kExceptionSignals[i], &act, NULL);
-    }
+void AcceleratorCS2::StartupServer(const GameSessionConfiguration_t& config, ISource2WorldSession*, const char*)
+{
+	strncpy(crashMap, g_pNetworkServerService->GetIGameServer()->GetMapName(), sizeof(crashMap) - 1);
+}
 
-    void AcceleratorCSS_MM::StartupServer(const GameSessionConfiguration_t &config, ISource2WorldSession *,
-                                          const char *pszMapName) {
-        if (pszMapName && *pszMapName)
-            std::snprintf(crashMap, sizeof(crashMap), "%s", pszMapName);
-    }
+const char* AcceleratorCS2::GetLicense()
+{
+	return "GPLv3";
+}
 
-    const char *AcceleratorCSS_MM::GetAuthor() { return "Slynx"; }
-    const char *AcceleratorCSS_MM::GetName() { return "AcceleratorCSS"; }
-    const char *AcceleratorCSS_MM::GetDescription() { return "Local crash handler for C# plugins"; }
-    const char *AcceleratorCSS_MM::GetURL() { return "https://funplay.pro/"; }
-    const char *AcceleratorCSS_MM::GetLicense() { return "GPLv3"; }
-    const char *AcceleratorCSS_MM::GetVersion() { return ACCELERATORCSS_VERSION; }
-    const char *AcceleratorCSS_MM::GetDate() { return __DATE__; }
-    const char *AcceleratorCSS_MM::GetLogTag() { return "ACC"; }
+const char* AcceleratorCS2::GetVersion()
+{
+	return ACCELERATORCS2_VERSION;
+}
+
+const char* AcceleratorCS2::GetDate()
+{
+	return __DATE__;
+}
+
+const char* AcceleratorCS2::GetLogTag()
+{
+	return "AcceleratorCS2";
+}
+
+const char* AcceleratorCS2::GetAuthor()
+{
+	return "Poggu, Phoenix (˙·٠●Феникс●٠·˙), asherkin, Slynx";
+}
+
+const char* AcceleratorCS2::GetDescription()
+{
+	return "Crash Handler";
+}
+
+const char* AcceleratorCS2::GetName()
+{
+	return "AcceleratorCS2";
+}
+
+const char* AcceleratorCS2::GetURL()
+{
+	return "https://github.com/Source2ZE/AcceleratorCS2";
 }
