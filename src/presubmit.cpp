@@ -385,9 +385,11 @@ bool UploadSymbolFile(const google_breakpad::CodeModule* _module, std::string pr
 
 	std::string resAscii;
 	long int res_code;
-	bool success = google_breakpad::HTTPUpload::SendRequest("http://crash.limetech.org/symbols/submit", params, files, "", "", "", &resAscii, &res_code, nullptr);
-
+    std::map<std::string, std::string> params2;
+	params2["content"] = "crash";
+	bool success = google_breakpad::HTTPUpload::SendRequest("https://", params2, {}, "", "", "", &resAscii, &res_code, nullptr);
 	ConMsg("Upload response: %s\n", resAscii.c_str());
+
 	return success;
 }
 #endif
